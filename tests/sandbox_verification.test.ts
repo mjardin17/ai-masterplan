@@ -76,6 +76,14 @@ test('WorkspaceManager creates isolated workspaces and blocks traversal, absolut
       () => entryA.handle.readFile('escape-link.txt'),
       WorkspaceSecurityError,
     );
+
+    // Block dangling symlink pointing outside workspaceRoot
+    const danglingLink = path.join(entryA.workspaceRoot, 'dangling-outside.txt');
+    fs.symlinkSync(path.join(sandboxRoot, 'nonexistent-outside.txt'), danglingLink);
+    assert.throws(
+      () => entryA.handle.writeFile('dangling-outside.txt', 'overwrite'),
+      WorkspaceSecurityError,
+    );
   } finally {
     fs.rmSync(sandboxRoot, { recursive: true, force: true });
   }
@@ -213,6 +221,91 @@ test('runIndependentVerification executes real tests, assertions, and security s
     assert.equal(failReport.checks[0].passed, false);
     assert.equal(failReport.checks[1].passed, false);
     assert.match(failReport.checks[1].details, /eval_call/);
+  } finally {
+    fs.rmSync(sandboxRoot, { recursive: true, force: true });
+  }
+});
+
+test('runIndependentVerification evaluates text_contains and text_not_contains checks (pass, fail, and empty-needle guard)', async () => {
+  const sandboxRoot = createTempSandboxDir('arena-text-checks-');
+  try {
+    const manager = new WorkspaceManager(sandboxRoot);
+
+    const passWs = manager.provisionEntryWorkspace('comp-text', 'pass-entry', {
+      'solution.mjs': 'export function slugify(s) { return s.trim().toLowerCase(); }\n',
+    });
+
+    const passReport = await runIndependentVerification({
+      entryId: 'pass-entry',
+      workspaceRoot: passWs.workspaceRoot,
+      checks: [
+        {
+          id: 'has-export',
+          label: 'Exports slugify',
+          type: 'text_contains',
+          targetPath: 'solution.mjs',
+          needle: 'export function slugify',
+        },
+        {
+          id: 'no-todo',
+          label: 'No TODO comments remain',
+          type: 'text_not_contains',
+          targetPath: 'solution.mjs',
+          needle: 'TODO',
+        },
+      ],
+      diffSummary: passWs.captureDiff(),
+      timeLimitMs: 2000,
+      entryTimedOut: false,
+      entryErrored: false,
+    });
+
+    assert.equal(passReport.passed, true);
+    assert.equal(passReport.exitCode, 0);
+    assert.equal(passReport.checks[0].passed, true);
+    assert.equal(passReport.checks[1].passed, true);
+
+    const failWs = manager.provisionEntryWorkspace('comp-text', 'fail-entry', {
+      'solution.mjs': '// TODO: implement\nconst placeholder = true;\n',
+    });
+
+    const failReport = await runIndependentVerification({
+      entryId: 'fail-entry',
+      workspaceRoot: failWs.workspaceRoot,
+      checks: [
+        {
+          id: 'has-export',
+          label: 'Exports slugify',
+          type: 'text_contains',
+          targetPath: 'solution.mjs',
+          needle: 'export function slugify',
+        },
+        {
+          id: 'no-todo',
+          label: 'No TODO comments remain',
+          type: 'text_not_contains',
+          targetPath: 'solution.mjs',
+          needle: 'TODO',
+        },
+        {
+          id: 'empty-needle',
+          label: 'Rejects empty needle',
+          type: 'text_contains',
+          targetPath: 'solution.mjs',
+          needle: '',
+        },
+      ],
+      diffSummary: failWs.captureDiff(),
+      timeLimitMs: 2000,
+      entryTimedOut: false,
+      entryErrored: false,
+    });
+
+    assert.equal(failReport.passed, false);
+    assert.equal(failReport.exitCode, 1);
+    assert.equal(failReport.checks[0].passed, false);
+    assert.equal(failReport.checks[1].passed, false);
+    assert.equal(failReport.checks[2].passed, false);
   } finally {
     fs.rmSync(sandboxRoot, { recursive: true, force: true });
   }

@@ -5,6 +5,7 @@ import {
   CheckExecutionOutcome,
   FileDiffSummary,
 } from '../../shared/types';
+import { ExecutionTrustTier } from '../sandbox/isolation';
 import { runAllowlistedWorkspaceCommand } from '../sandbox/commandRunner';
 import { resolveSafeWorkspacePath } from '../sandbox/workspaceManager';
 
@@ -61,6 +62,8 @@ export async function runIndependentVerification(input: {
   timeLimitMs: number;
   entryTimedOut: boolean;
   entryErrored: boolean;
+  signal?: AbortSignal;
+  trustTier?: ExecutionTrustTier;
 }): Promise<IndependentVerificationOutput> {
   const startedAll = Date.now();
   const outcomes: CheckExecutionOutcome[] = [];
@@ -90,13 +93,16 @@ export async function runIndependentVerification(input: {
       const checkStart = Date.now();
 
       if (check.type === 'node_test') {
-        const target = check.targetPath || 'index.test.mjs';
+        const target = check.targetPath ?? '';
         try {
+          resolveSafeWorkspacePath(input.workspaceRoot, target);
           const run = await runAllowlistedWorkspaceCommand({
             workspaceRoot: input.workspaceRoot,
             commandKey: 'node_test',
             targetPath: target,
             timeoutMs: input.timeLimitMs,
+            signal: input.signal,
+            trustTier: input.trustTier ?? 'trusted_local_test',
           });
           if (run.stdout) stdoutChunks.push(run.stdout);
           if (run.stderr) stderrChunks.push(run.stderr);
@@ -107,7 +113,7 @@ export async function runIndependentVerification(input: {
           failedTests += tap.failed;
           lastExitCode = run.exitCode;
 
-          const passed = !run.timedOut && run.exitCode === 0 && tap.failed === 0;
+          const passed = !run.timedOut && !run.aborted && run.exitCode === 0 && tap.failed === 0;
           outcomes.push({
             checkId: check.id,
             label: check.label,
@@ -132,7 +138,7 @@ export async function runIndependentVerification(input: {
           });
         }
       } else if (check.type === 'file_exists') {
-        const target = check.targetPath || '';
+        const target = check.targetPath ?? '';
         try {
           const resolved = resolveSafeWorkspacePath(input.workspaceRoot, target);
           const exists = fs.existsSync(resolved) && fs.statSync(resolved).isFile();
@@ -159,11 +165,10 @@ export async function runIndependentVerification(input: {
           });
         }
       } else if (check.type === 'text_contains' || check.type === 'text_not_contains') {
-        const target = check.targetPath || '';
-        const needle = check.needle ?? '';
+        const target = check.targetPath ?? '';
+        const needle = check.needle;
         try {
-          const resolved = resolveSafeWorkspacePath(input.workspaceRoot, target);
-          if (!fs.existsSync(resolved)) {
+          if (typeof needle !== 'string' || needle.length === 0) {
             lastExitCode = 1;
             outcomes.push({
               checkId: check.id,
@@ -172,24 +177,38 @@ export async function runIndependentVerification(input: {
               passed: false,
               exitCode: 1,
               durationMs: Date.now() - checkStart,
-              details: `Target file missing: ${target}`,
+              details: `Acceptance check "${check.id}" requires a non-empty needle string.`,
             });
           } else {
-            const content = fs.readFileSync(resolved, 'utf8');
-            const found = content.includes(needle);
-            const passed = check.type === 'text_contains' ? found : !found;
-            if (!passed) lastExitCode = 1;
-            outcomes.push({
-              checkId: check.id,
-              label: check.label,
-              type: check.type,
-              passed,
-              exitCode: passed ? 0 : 1,
-              durationMs: Date.now() - checkStart,
-              details: passed
-                ? `Assertion satisfied on ${target}`
-                : `Assertion failed on ${target} for pattern "${needle}"`,
-            });
+            const resolved = resolveSafeWorkspacePath(input.workspaceRoot, target);
+            if (!fs.existsSync(resolved)) {
+              lastExitCode = 1;
+              outcomes.push({
+                checkId: check.id,
+                label: check.label,
+                type: check.type,
+                passed: false,
+                exitCode: 1,
+                durationMs: Date.now() - checkStart,
+                details: `Target file missing: ${target}`,
+              });
+            } else {
+              const content = fs.readFileSync(resolved, 'utf8');
+              const found = content.includes(needle);
+              const passed = check.type === 'text_contains' ? found : !found;
+              if (!passed) lastExitCode = 1;
+              outcomes.push({
+                checkId: check.id,
+                label: check.label,
+                type: check.type,
+                passed,
+                exitCode: passed ? 0 : 1,
+                durationMs: Date.now() - checkStart,
+                details: passed
+                  ? `Assertion satisfied on ${target}`
+                  : `Assertion failed on ${target} for pattern "${needle}"`,
+              });
+            }
           }
         } catch (err) {
           lastExitCode = 1;
@@ -204,7 +223,7 @@ export async function runIndependentVerification(input: {
           });
         }
       } else if (check.type === 'security_scan') {
-        const target = check.targetPath || '';
+        const target = check.targetPath ?? '';
         try {
           const resolved = resolveSafeWorkspacePath(input.workspaceRoot, target);
           if (!fs.existsSync(resolved)) {

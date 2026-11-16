@@ -15,9 +15,21 @@ import { ArenaRepository } from '../db/repositories/arenaRepo';
 import { AuditRepository } from '../db/repositories/auditRepo';
 import { ContestantsRepository } from '../db/repositories/contestantsRepo';
 import { LearningObservationRecorder } from '../learning/observations';
-import { ScopedWorkspaceHandle, WorkspaceManager } from '../sandbox/workspaceManager';
+import {
+  ScopedWorkspaceHandle,
+  WorkspaceManager,
+  WorkspaceSecurityError,
+} from '../sandbox/workspaceManager';
+import {
+  assertExecutionAllowedForTrustTier,
+  detectSandboxCapabilities,
+  ExecutionTrustTier,
+  SandboxCapabilities,
+  SandboxIsolationError,
+} from '../sandbox/isolation';
 import { calculateEntryScore } from '../scoring/engine';
 import { runIndependentVerification } from '../verification/verifier';
+import { TaskValidationError, validateBenchmarkTaskInput } from './validation';
 
 export class ArenaServiceError extends Error {
   constructor(
@@ -38,6 +50,7 @@ export interface CompetitionExecutorContext {
   tokenBudget: number;
   costCapUsd: number;
   workspace: ScopedWorkspaceHandle;
+  signal: AbortSignal;
 }
 
 export interface CompetitionExecutorResult {
@@ -49,15 +62,6 @@ export interface CompetitionExecutorResult {
 export type CompetitionEntryExecutor = (
   ctx: CompetitionExecutorContext,
 ) => Promise<CompetitionExecutorResult>;
-
-const VALID_CATEGORIES: ArenaCategory[] = [
-  'coding',
-  'reasoning',
-  'research',
-  'debugging',
-  'security',
-  'recovery',
-];
 
 export class ArenaService {
   private readonly observationRecorder: LearningObservationRecorder;
@@ -71,6 +75,10 @@ export class ArenaService {
     private readonly allowPaidLiveExecution = false,
   ) {
     this.observationRecorder = new LearningObservationRecorder(arenaRepo);
+  }
+
+  getIsolationCapabilities(): SandboxCapabilities {
+    return detectSandboxCapabilities();
   }
 
   async listTasks(category?: ArenaCategory): Promise<BenchmarkTaskDTO[]> {
@@ -91,38 +99,26 @@ export class ArenaService {
       costCapUsd: number;
     },
   ): Promise<BenchmarkTaskDTO> {
-    if (!input.title || input.title.trim().length < 3) {
-      throw new ArenaServiceError(400, 'Task title must be at least 3 characters.');
-    }
-    if (!VALID_CATEGORIES.includes(input.category)) {
-      throw new ArenaServiceError(400, `Invalid category: ${input.category}`);
-    }
-    if (!input.instructions || input.instructions.trim().length < 10) {
-      throw new ArenaServiceError(400, 'Task instructions must be at least 10 characters.');
-    }
-    if (!Array.isArray(input.acceptanceChecks) || input.acceptanceChecks.length === 0) {
-      throw new ArenaServiceError(400, 'At least one independent acceptance check is required.');
-    }
-    if (!Number.isFinite(input.timeLimitMs) || input.timeLimitMs < 500 || input.timeLimitMs > 120_000) {
-      throw new ArenaServiceError(400, 'timeLimitMs must be between 500 and 120000.');
-    }
-    if (!Number.isFinite(input.tokenBudget) || input.tokenBudget < 100) {
-      throw new ArenaServiceError(400, 'tokenBudget must be at least 100.');
-    }
-    if (!Number.isFinite(input.costCapUsd) || input.costCapUsd < 0) {
-      throw new ArenaServiceError(400, 'costCapUsd must be non-negative.');
+    let validated;
+    try {
+      validated = validateBenchmarkTaskInput(input);
+    } catch (err) {
+      throw new ArenaServiceError(
+        400,
+        err instanceof TaskValidationError ? err.message : 'Invalid benchmark task specification.',
+      );
     }
 
     const task = await this.arenaRepo.createTask({
-      title: input.title,
-      category: input.category,
-      description: input.description || input.title,
-      instructions: input.instructions,
-      startingFiles: input.startingFiles ?? {},
-      acceptanceChecks: input.acceptanceChecks,
-      timeLimitMs: Math.round(input.timeLimitMs),
-      tokenBudget: Math.round(input.tokenBudget),
-      costCapUsd: input.costCapUsd,
+      title: validated.title,
+      category: validated.category,
+      description: validated.description,
+      instructions: validated.instructions,
+      startingFiles: validated.startingFiles,
+      acceptanceChecks: validated.acceptanceChecks,
+      timeLimitMs: validated.timeLimitMs,
+      tokenBudget: validated.tokenBudget,
+      costCapUsd: validated.costCapUsd,
       createdByUserId: actor.id,
     });
 
@@ -137,6 +133,7 @@ export class ArenaService {
         title: task.title,
         category: task.category,
         checksCount: task.acceptanceChecks.length,
+        startingFilesCount: Object.keys(task.startingFiles).length,
       },
     });
 
@@ -280,6 +277,7 @@ export class ArenaService {
       );
     }
 
+    const caps = this.getIsolationCapabilities();
     await this.auditRepo.append({
       actorType: 'user',
       actorId: actor.id,
@@ -287,24 +285,62 @@ export class ArenaService {
       action: 'arena.live_launch_blocked_by_policy',
       resourceType: 'competition',
       resourceId: competitionId,
-      metadata: { allowPaidLiveExecution: this.allowPaidLiveExecution },
+      metadata: {
+        allowPaidLiveExecution: this.allowPaidLiveExecution,
+        untrustedContestantExecutionPermitted: caps.untrustedContestantExecutionPermitted,
+        missingMechanisms: caps.missingMechanisms,
+      },
     });
+
+    if (!this.allowPaidLiveExecution) {
+      throw new ArenaServiceError(
+        403,
+        'Paid AI model competitions are disabled in Milestone 2 by policy. Infrastructure verification runs only via isolated test fixtures.',
+      );
+    }
+
+    try {
+      assertExecutionAllowedForTrustTier('untrusted_contestant', caps);
+    } catch (err) {
+      throw new ArenaServiceError(
+        403,
+        err instanceof SandboxIsolationError
+          ? err.message
+          : 'Live competition launch blocked by fail-closed isolation policy.',
+      );
+    }
 
     throw new ArenaServiceError(
       403,
-      'Paid AI model competitions are disabled in Milestone 2 by policy. Infrastructure verification runs only via isolated test fixtures.',
+      'Live AI contestant execution is blocked by fail-closed policy.',
     );
   }
 
   /**
    * Executes a staged competition using explicitly supplied isolated executors
-   * (used by automated Milestone 2 verification suites with deterministic test-only adapters).
+   * (used by verification suites with deterministic test-only adapters).
+   * Rejects `trustTier: 'untrusted_contestant'` fail-closed when a dedicated
+   * external OS/container sandbox is unavailable.
    */
   async executeWithExecutors(
     actor: PublicUser,
     competitionId: string,
     executorsByContestant: Record<string, CompetitionEntryExecutor>,
+    options?: {
+      trustTier?: ExecutionTrustTier;
+      signal?: AbortSignal;
+    },
   ): Promise<CompetitionDetailDTO> {
+    const trustTier: ExecutionTrustTier = options?.trustTier ?? 'trusted_local_test';
+    try {
+      assertExecutionAllowedForTrustTier(trustTier, this.getIsolationCapabilities());
+    } catch (err) {
+      throw new ArenaServiceError(
+        403,
+        err instanceof SandboxIsolationError ? err.message : 'Execution blocked by isolation policy.',
+      );
+    }
+
     const detail = await this.getCompetitionDetail(competitionId);
     const { competition, task, entries } = detail;
 
@@ -340,8 +376,28 @@ export class ArenaService {
       let tokensOut = 0;
       let estimatedCostUsd = 0;
 
-      try {
-        const execPromise = executor({
+      const abortController = new AbortController();
+      const parentSignal = options?.signal;
+      const onParentAbort = () => {
+        abortController.abort(
+          parentSignal?.reason instanceof Error
+            ? parentSignal.reason
+            : new Error('ENTRY_TIMEOUT: competition execution aborted'),
+        );
+      };
+      if (parentSignal) {
+        if (parentSignal.aborted) {
+          onParentAbort();
+        } else {
+          parentSignal.addEventListener('abort', onParentAbort, { once: true });
+        }
+      }
+
+      let timeoutTimer: NodeJS.Timeout | null = null;
+      let timedOutAbort = false;
+
+      const execPromise = Promise.resolve().then(() =>
+        executor({
           competitionId,
           entryId: entry.id,
           category: task.category,
@@ -350,29 +406,73 @@ export class ArenaService {
           tokenBudget: task.tokenBudget,
           costCapUsd: task.costCapUsd,
           workspace: provisioned.handle,
+          signal: abortController.signal,
+        }),
+      );
+      // Prevent unhandled rejections if the underlying promise rejects after timeout settles
+      execPromise.catch(() => undefined);
+
+      try {
+        const abortPromise = new Promise<never>((_, reject) => {
+          const rejectWithReason = () => {
+            timedOutAbort = true;
+            const reason = abortController.signal.reason;
+            reject(
+              reason instanceof Error
+                ? reason
+                : new Error(`ENTRY_TIMEOUT: exceeded ${task.timeLimitMs}ms`),
+            );
+          };
+          if (abortController.signal.aborted) {
+            rejectWithReason();
+            return;
+          }
+          abortController.signal.addEventListener('abort', rejectWithReason, { once: true });
         });
 
-        const timeoutPromise = new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`ENTRY_TIMEOUT: exceeded ${task.timeLimitMs}ms`)),
-            task.timeLimitMs,
-          ),
-        );
+        timeoutTimer = setTimeout(() => {
+          abortController.abort(new Error(`ENTRY_TIMEOUT: exceeded ${task.timeLimitMs}ms`));
+        }, task.timeLimitMs);
 
-        const result = await Promise.race([execPromise, timeoutPromise]);
+        const result = await Promise.race([execPromise, abortPromise]);
         tokensIn = result.tokensIn;
         tokensOut = result.tokensOut;
         estimatedCostUsd = result.estimatedCostUsd;
       } catch (err) {
         const safe = sanitizeErrorMessage(err);
         errorMessage = safe;
-        if (safe.startsWith('ENTRY_TIMEOUT:')) {
+        if (timedOutAbort || safe.startsWith('ENTRY_TIMEOUT:')) {
           entryStatus = 'timed_out';
-        } else if (safe.toLowerCase().includes('outside workspace') || safe.toLowerCase().includes('symlink')) {
+        } else if (
+          err instanceof WorkspaceSecurityError ||
+          err instanceof SandboxIsolationError ||
+          safe.toLowerCase().includes('outside workspace') ||
+          safe.toLowerCase().includes('symlink')
+        ) {
           entryStatus = 'blocked';
         } else {
           entryStatus = 'failed';
         }
+      } finally {
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer);
+        }
+        if (parentSignal) {
+          parentSignal.removeEventListener('abort', onParentAbort);
+        }
+      }
+
+      if (abortController.signal.aborted) {
+        // Give abort listeners (e.g. child process-group SIGKILL) bounded time to finish reaping PIDs
+        let cleanupTimer: NodeJS.Timeout | null = null;
+        await Promise.race([
+          execPromise.catch(() => undefined),
+          new Promise<void>((resolve) => {
+            cleanupTimer = setTimeout(resolve, 150);
+            cleanupTimer.unref();
+          }),
+        ]);
+        if (cleanupTimer) clearTimeout(cleanupTimer);
       }
 
       const executionTimeMs = Date.now() - entryStartMs;
@@ -400,6 +500,8 @@ export class ArenaService {
         timeLimitMs: task.timeLimitMs,
         entryTimedOut: entryStatus === 'timed_out',
         entryErrored: entryStatus === 'failed' || entryStatus === 'blocked',
+        signal: options?.signal,
+        trustTier: 'trusted_local_test',
       });
 
       const report = await this.arenaRepo.saveVerificationReport({

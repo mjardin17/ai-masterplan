@@ -41,29 +41,37 @@ export function createArenaRouter(deps: { arenaService: ArenaService }): Router 
     },
   );
 
+  router.get(
+    '/isolation',
+    requireRole(['admin', 'operator', 'reviewer', 'viewer']),
+    (_req, res) => {
+      res.json({ isolation: deps.arenaService.getIsolationCapabilities() });
+    },
+  );
+
   router.post(
     '/tasks',
     requireRole(['admin', 'operator']),
     async (req, res, next) => {
       try {
-        const body = req.body ?? {};
+        const body = (req.body ?? {}) as Record<string, unknown>;
         const task = await deps.arenaService.createTask(req.authUser!, {
-          title: String(body.title ?? ''),
+          title: body.title as string,
           category: body.category as ArenaCategory,
-          description: String(body.description ?? ''),
-          instructions: String(body.instructions ?? ''),
+          description:
+            body.description === undefined ? '' : (body.description as string),
+          instructions: body.instructions as string,
           startingFiles:
-            body.startingFiles &&
-            typeof body.startingFiles === 'object' &&
-            !Array.isArray(body.startingFiles)
-              ? (body.startingFiles as Record<string, string>)
-              : {},
-          acceptanceChecks: Array.isArray(body.acceptanceChecks)
-            ? body.acceptanceChecks
-            : [],
-          timeLimitMs: Number(body.timeLimitMs ?? 5000),
-          tokenBudget: Number(body.tokenBudget ?? 4000),
-          costCapUsd: Number(body.costCapUsd ?? 0.5),
+            body.startingFiles === undefined
+              ? {}
+              : (body.startingFiles as Record<string, string>),
+          acceptanceChecks: body.acceptanceChecks as never,
+          timeLimitMs:
+            body.timeLimitMs === undefined ? 5000 : (body.timeLimitMs as number),
+          tokenBudget:
+            body.tokenBudget === undefined ? 4000 : (body.tokenBudget as number),
+          costCapUsd:
+            body.costCapUsd === undefined ? 0.5 : (body.costCapUsd as number),
         });
         res.status(201).json({ task });
       } catch (err) {

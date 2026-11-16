@@ -214,9 +214,14 @@ export function ArenaPanel({
         setError('Starting files must be a JSON object mapping relative paths to string contents.');
         return;
       }
-      parsedStartingFiles = Object.fromEntries(
-        Object.entries(raw as Record<string, unknown>).map(([k, v]) => [k, String(v)]),
-      );
+      const entries = Object.entries(raw as Record<string, unknown>);
+      for (const [k, v] of entries) {
+        if (typeof v !== 'string') {
+          setError(`Starting file "${k}" value must be a JSON string.`);
+          return;
+        }
+      }
+      parsedStartingFiles = Object.fromEntries(entries as [string, string][]);
     } catch {
       setError('Starting files JSON is invalid.');
       return;

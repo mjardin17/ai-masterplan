@@ -22,24 +22,42 @@ function sha256Text(content: string): string {
   return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
 }
 
-export function resolveSafeWorkspacePath(workspaceRoot: string, relPath: string): string {
+/**
+ * Validates that a workspace relative file path is strictly canonical POSIX-relative,
+ * free of traversal, absolute prefixes, backslashes, null bytes, or control characters.
+ */
+export function validateRelativeWorkspacePath(relPath: unknown, label = 'path'): string {
   if (typeof relPath !== 'string' || relPath.trim() === '') {
-    throw new WorkspaceSecurityError('Relative workspace file path is required.');
+    throw new WorkspaceSecurityError(`Relative workspace ${label} is required.`);
   }
-  if (relPath.includes('\0')) {
-    throw new WorkspaceSecurityError('Null byte in path is forbidden.');
+  if (relPath !== relPath.trim()) {
+    throw new WorkspaceSecurityError(`Leading or trailing whitespace forbidden in ${label}: "${relPath}"`);
+  }
+  if (relPath.includes('\0') || /[\x00-\x1f\x7f]/.test(relPath)) {
+    throw new WorkspaceSecurityError(`Null byte or control character in ${label} is forbidden.`);
   }
   if (relPath.includes('\\')) {
-    throw new WorkspaceSecurityError('Backslashes are forbidden in workspace relative paths.');
+    throw new WorkspaceSecurityError(`Backslashes are forbidden in workspace relative ${label}: ${relPath}`);
   }
-  if (path.isAbsolute(relPath)) {
-    throw new WorkspaceSecurityError(`Absolute path forbidden: ${relPath}`);
+  if (relPath.startsWith('/') || path.isAbsolute(relPath) || /^[A-Za-z]:/.test(relPath)) {
+    throw new WorkspaceSecurityError(`Absolute path forbidden in ${label}: ${relPath}`);
   }
+
+  const segments = relPath.split('/');
+  if (segments.some((seg) => seg === '' || seg === '.' || seg === '..')) {
+    throw new WorkspaceSecurityError(`Unsafe or traversal segment forbidden in ${label}: ${relPath}`);
+  }
+
+  return relPath;
+}
+
+export function resolveSafeWorkspacePath(workspaceRoot: string, relPath: string): string {
+  const cleanRel = validateRelativeWorkspacePath(relPath, 'file path');
 
   const rootResolved = fs.existsSync(workspaceRoot)
     ? fs.realpathSync(workspaceRoot)
     : path.resolve(workspaceRoot);
-  const candidate = path.resolve(rootResolved, relPath);
+  const candidate = path.resolve(rootResolved, cleanRel);
   const relative = path.relative(rootResolved, candidate);
 
   if (
@@ -51,19 +69,30 @@ export function resolveSafeWorkspacePath(workspaceRoot: string, relPath: string)
     throw new WorkspaceSecurityError(`Path traversal outside workspace forbidden: ${relPath}`);
   }
 
-  // Verify no existing parent or target symlink escapes the workspace root
+  // Verify no existing parent or target symlink (including dangling symlinks) escapes the workspace root
   let current = candidate;
   while (current !== rootResolved) {
-    if (fs.existsSync(current)) {
-      const stat = fs.lstatSync(current);
-      if (stat.isSymbolicLink()) {
-        const realTarget = fs.realpathSync(current);
-        const relTarget = path.relative(rootResolved, realTarget);
-        if (relTarget.startsWith('..') || path.isAbsolute(relTarget)) {
-          throw new WorkspaceSecurityError(`Symlink escape outside workspace forbidden: ${relPath}`);
-        }
+    let stat: fs.Stats | null = null;
+    try {
+      stat = fs.lstatSync(current);
+    } catch {
+      stat = null;
+    }
+
+    if (stat?.isSymbolicLink()) {
+      let resolvedLinkTarget: string;
+      try {
+        resolvedLinkTarget = fs.realpathSync(current);
+      } catch {
+        const rawLink = fs.readlinkSync(current);
+        resolvedLinkTarget = path.resolve(path.dirname(current), rawLink);
+      }
+      const relTarget = path.relative(rootResolved, resolvedLinkTarget);
+      if (relTarget === '..' || relTarget.startsWith(`..${path.sep}`) || path.isAbsolute(relTarget)) {
+        throw new WorkspaceSecurityError(`Symlink escape outside workspace forbidden: ${relPath}`);
       }
     }
+
     const parent = path.dirname(current);
     if (parent === current) break;
     current = parent;
